@@ -63,7 +63,37 @@ SLOTS_PER_BOX = 30
 
 # Sections 5-13 hold PC storage; each section contributes 3968 (0xF80) bytes of payload.
 SECTION_DATA_SIZE = 0x0F80
-PC_BOX_DATA_OFFSET = 4  # u32 currentBox sits before the pokemon array
+# struct PokemonStorage { u8 currentBox; /* +3 pad */ BoxPokemon boxes[14][30]; }
+PC_BOX_DATA_OFFSET = 4
+
+# For each personality % 24: where logical substruct G,A,E,M live among 4 physical 12-byte chunks.
+# From pret pokefirered GetSubstruct (SUBSTRUCT_CASE): type 0 at v1, type 1 at v2, ...
+_SUBSTRUCT_PHYS = (
+    (0, 1, 2, 3),
+    (0, 1, 3, 2),
+    (0, 2, 1, 3),
+    (0, 3, 1, 2),
+    (0, 2, 3, 1),
+    (0, 3, 2, 1),
+    (1, 0, 2, 3),
+    (1, 0, 3, 2),
+    (2, 0, 1, 3),
+    (3, 0, 1, 2),
+    (2, 0, 3, 1),
+    (3, 0, 2, 1),
+    (1, 2, 0, 3),
+    (1, 3, 0, 2),
+    (2, 1, 0, 3),
+    (3, 1, 0, 2),
+    (2, 3, 0, 1),
+    (3, 2, 0, 1),
+    (1, 2, 3, 0),
+    (1, 3, 2, 0),
+    (2, 1, 3, 0),
+    (3, 1, 2, 0),
+    (2, 3, 1, 0),
+    (3, 2, 1, 0),
+)
 
 NATURES = {
     0: "Hardy", 1: "Lonely", 2: "Brave", 3: "Adamant", 4: "Naughty",
@@ -133,6 +163,187 @@ def _decode_name(raw):
     return out.rstrip()
 
 
+def _substruct_checksum(growth, attacks, evs, misc):
+    """Matches CalculateBoxMonChecksum in pokefirered (sum of u16 halfwords, u16 wrap)."""
+    total = 0
+    for sub in (growth, attacks, evs, misc):
+        for i in range(0, 12, 2):
+            total = (total + struct.unpack_from("<H", sub, i)[0]) & 0xFFFF
+    return total
+
+
+def _build_mon_dict(pid, nickname, species_id, item_id, move_ids, evs6, iv_word, level):
+    """Shared Showdown field builder (species_id must be valid index)."""
+    if species_id == 0 or species_id > len(SPECIES_NAMES):
+        return None
+    species = _species_name(species_id)
+    if not species:
+        return None
+
+    item = _item_name(item_id) if item_id else None
+    moves = []
+    for m in move_ids:
+        if m != 0:
+            mn = _move_name(m)
+            if mn:
+                moves.append(mn)
+
+    ev_hp, ev_atk, ev_def, ev_spd, ev_spa, ev_spd2 = evs6
+
+    iv_hp = iv_word & 0x1F
+    iv_atk = (iv_word >> 5) & 0x1F
+    iv_def = (iv_word >> 10) & 0x1F
+    iv_spd = (iv_word >> 15) & 0x1F
+    iv_spa = (iv_word >> 20) & 0x1F
+    iv_spd2 = (iv_word >> 25) & 0x1F
+    is_egg = bool((iv_word >> 30) & 1)
+    ability_bit = (iv_word >> 31) & 1
+
+    ab_type = "h" if ability_bit else ("1" if pid % 2 == 0 else "2")
+    ability = _ability_name(species, ab_type)
+    nature = NATURES[pid % 25]
+
+    return {
+        "species": species,
+        "nickname": nickname,
+        "level": level,
+        "item": item,
+        "ability": ability,
+        "nature": nature,
+        "moves": moves,
+        "evs": {
+            "HP": ev_hp,
+            "Atk": ev_atk,
+            "Def": ev_def,
+            "SpA": ev_spa,
+            "SpD": ev_spd2,
+            "Spe": ev_spd,
+        },
+        "ivs": {
+            "HP": iv_hp,
+            "Atk": iv_atk,
+            "Def": iv_def,
+            "SpA": iv_spa,
+            "SpD": iv_spd2,
+            "Spe": iv_spd,
+        },
+        "is_egg": is_egg,
+    }
+
+
+def _parse_boxmon_encrypted(buf):
+    """Standard Gen III BoxPokemon: decrypt secure region, unshuffle, verify checksum."""
+    if len(buf) < BOX_ENTRY_SIZE:
+        return None
+
+    pid = struct.unpack_from("<I", buf, 0)[0]
+    ot_id = struct.unpack_from("<I", buf, 4)[0]
+    if pid == 0 and ot_id == 0:
+        return None
+
+    flags = buf[19]
+    if flags & 1:  # bad egg
+        return None
+    if (flags >> 2) & 1:  # egg (box metadata)
+        return None
+
+    nickname = _decode_name(buf[8:18])
+    chk_stored = struct.unpack_from("<H", buf, 28)[0]
+
+    enc_words = struct.unpack_from("<12I", buf, 32)
+    dec_words = [w ^ ot_id ^ pid for w in enc_words]
+    raw48 = struct.pack("<12I", *dec_words)
+    phys = [raw48[i : i + 12] for i in range(0, 48, 12)]
+
+    pidx = pid % 24
+    gi, ai, ei, mi = _SUBSTRUCT_PHYS[pidx]
+    growth = phys[gi]
+    attacks = phys[ai]
+    ev_sub = phys[ei]
+    misc = phys[mi]
+
+    if _substruct_checksum(growth, attacks, ev_sub, misc) != chk_stored:
+        return None
+
+    species_id = struct.unpack_from("<H", growth, 0)[0]
+    item_id = struct.unpack_from("<H", growth, 2)[0]
+    move_ids = struct.unpack_from("<4H", attacks, 0)
+    evs6 = struct.unpack_from("6B", ev_sub, 0)
+    iv_word = struct.unpack_from("<I", misc, 4)[0]
+
+    return _build_mon_dict(pid, nickname, species_id, item_id, move_ids, evs6, iv_word, None)
+
+
+def _parse_boxmon_plaintext(buf, level=None):
+    """Radical Red sometimes stores party substructs as plaintext (fixed GAEM layout)."""
+    if len(buf) < BOX_ENTRY_SIZE:
+        return None
+
+    pid = struct.unpack_from("<I", buf, 0)[0]
+    if pid == 0:
+        return None
+    if (buf[19] >> 2) & 1:
+        return None
+
+    species_id = struct.unpack_from("<H", buf, 32)[0]
+    if species_id == 0 or species_id > len(SPECIES_NAMES):
+        return None
+
+    nickname = _decode_name(buf[8:18])
+    item_id = struct.unpack_from("<H", buf, 34)[0]
+    move_ids = struct.unpack_from("<4H", buf, 44)
+    evs6 = struct.unpack_from("6B", buf, 56)
+    iv_word = struct.unpack_from("<I", buf, 72)[0]
+
+    mon = _build_mon_dict(
+        pid, nickname, species_id, item_id, move_ids, evs6, iv_word, level
+    )
+    return mon
+
+
+def _mon_stats_sane(mon):
+    if mon is None or mon["is_egg"]:
+        return False
+    evs = mon["evs"]
+    if sum(evs.values()) > 510:
+        return False
+    if any(v > 255 for v in evs.values()):
+        return False
+    if any(v > 31 for v in mon["ivs"].values()):
+        return False
+    return True
+
+
+def _parse_party_slot(buf):
+    """100-byte party struct: try encrypted BoxMon first, then RR plaintext."""
+    if len(buf) < PARTY_ENTRY_SIZE:
+        return None
+    box = buf[:BOX_ENTRY_SIZE]
+    level = buf[84]
+
+    mon = _parse_boxmon_encrypted(box)
+    if mon is not None:
+        mon["level"] = level
+        if _mon_stats_sane(mon):
+            return mon
+
+    mon = _parse_boxmon_plaintext(box, level=level)
+    if mon is not None and _mon_stats_sane(mon):
+        return mon
+    return None
+
+
+def _parse_box_slot(buf):
+    """80-byte PC BoxPokemon — always encrypted in retail saves."""
+    mon = _parse_boxmon_encrypted(buf)
+    if mon is not None and _mon_stats_sane(mon):
+        return mon
+    mon = _parse_boxmon_plaintext(buf, level=None)
+    if mon is not None and _mon_stats_sane(mon):
+        return mon
+    return None
+
+
 def _get_sections(sav_data):
     """Return {section_id: section_bytes} from the newest of the two save blocks."""
     if len(sav_data) != SAVE_FILE_SIZE:
@@ -160,75 +371,6 @@ def _get_sections(sav_data):
     return blocks[latest]
 
 
-def _parse_pokemon(buf, is_party):
-    """Parse one Pokemon from raw bytes (100 for party, 80 for box). Returns dict or None.
-
-    Radical Red v4.1 stores substructure data unencrypted in fixed GAEM order,
-    so the byte offsets match the canonical layout without needing XOR decryption
-    or personality-based reordering.
-    """
-    if len(buf) < BOX_ENTRY_SIZE:
-        return None
-
-    pid = struct.unpack_from("<I", buf, 0)[0]
-    if pid == 0:
-        return None
-
-    species_id = struct.unpack_from("<H", buf, 32)[0]
-    if species_id == 0 or species_id > len(SPECIES_NAMES):
-        return None
-
-    species = _species_name(species_id)
-    if not species:
-        return None
-
-    nickname = _decode_name(buf[8:18])
-    item = _item_name(struct.unpack_from("<H", buf, 34)[0])
-
-    move_ids = struct.unpack_from("<4H", buf, 44)
-    moves = [_move_name(m) for m in move_ids if m != 0]
-    moves = [m for m in moves if m is not None]
-
-    ev_hp, ev_atk, ev_def, ev_spd, ev_spa, ev_spd2 = struct.unpack_from("6B", buf, 56)
-
-    iv_word = struct.unpack_from("<I", buf, 72)[0]
-    iv_hp = iv_word & 0x1F
-    iv_atk = (iv_word >> 5) & 0x1F
-    iv_def = (iv_word >> 10) & 0x1F
-    iv_spd = (iv_word >> 15) & 0x1F
-    iv_spa = (iv_word >> 20) & 0x1F
-    iv_spd2 = (iv_word >> 25) & 0x1F
-    is_egg = bool((iv_word >> 30) & 1)
-    ability_bit = (iv_word >> 31) & 1
-
-    ab_type = "h" if ability_bit else ("1" if pid % 2 == 0 else "2")
-    ability = _ability_name(species, ab_type)
-    nature = NATURES[pid % 25]
-
-    level = None
-    if is_party and len(buf) >= 85:
-        level = buf[84]
-
-    return {
-        "species": species,
-        "nickname": nickname,
-        "level": level,
-        "item": item,
-        "ability": ability,
-        "nature": nature,
-        "moves": moves,
-        "evs": {
-            "HP": ev_hp, "Atk": ev_atk, "Def": ev_def,
-            "SpA": ev_spa, "SpD": ev_spd2, "Spe": ev_spd,
-        },
-        "ivs": {
-            "HP": iv_hp, "Atk": iv_atk, "Def": iv_def,
-            "SpA": iv_spa, "SpD": iv_spd2, "Spe": iv_spd,
-        },
-        "is_egg": is_egg,
-    }
-
-
 def extract_pokemon(sav_data):
     """Return (party_list, boxes_dict) from raw save bytes.
 
@@ -245,7 +387,7 @@ def extract_pokemon(sav_data):
         )
         for i in range(count):
             off = PARTY_DATA_OFFSET + i * PARTY_ENTRY_SIZE
-            pkmn = _parse_pokemon(sec1[off : off + PARTY_ENTRY_SIZE], is_party=True)
+            pkmn = _parse_party_slot(sec1[off : off + PARTY_ENTRY_SIZE])
             if pkmn and not pkmn["is_egg"]:
                 party.append(pkmn)
 
@@ -264,9 +406,7 @@ def extract_pokemon(sav_data):
                 off = PC_BOX_DATA_OFFSET + (bx * SLOTS_PER_BOX + slot) * BOX_ENTRY_SIZE
                 if off + BOX_ENTRY_SIZE > len(pc_blob):
                     break
-                pkmn = _parse_pokemon(
-                    pc_blob[off : off + BOX_ENTRY_SIZE], is_party=False
-                )
+                pkmn = _parse_box_slot(pc_blob[off : off + BOX_ENTRY_SIZE])
                 if pkmn and not pkmn["is_egg"]:
                     mons.append(pkmn)
             if mons:

@@ -37,6 +37,10 @@ Paste the exported text directly into the [Radical Red Teambuilder](https://play
 
 > Double-check your sets before relying on damage calcs — minor discrepancies are possible.
 
+## Technical note
+
+PC Box Pokémon are stored in the normal **Generation III** format: the 48-byte `secure` region is XOR-scrambled with the Pokémon’s personality and OT ID, and the four 12-byte substructures are **shuffled** based on `personality % 24`. The exporter decrypts and unshuffles them (same logic as [pret/pokefirered](https://github.com/pret/pokefirered)) and checks the stored checksum so junk slots are skipped.
+
 ## Credits
 
 Huge thanks to [Bulbapedia](https://bulbapedia.bulbagarden.net/) for the GBA save data structure documentation.
