@@ -39,7 +39,7 @@ Paste the exported text directly into the [Radical Red Teambuilder](https://play
 
 ## Technical note
 
-PC Box Pokémon are stored in the normal **Generation III** format: the 48-byte `secure` region is XOR-scrambled with the Pokémon’s personality and OT ID, and the four 12-byte substructures are **shuffled** based on `personality % 24`. The exporter decrypts and unshuffles them (same logic as [pret/pokefirered](https://github.com/pret/pokefirered)) and checks the stored checksum so junk slots are skipped.
+Radical Red often stores Pokémon substructures **decrypted**, in fixed order (Growth → Attacks → EVs → Misc) with a **checksum** — the same layout as the party `BoxPokemon` in RAM. The app tries that first, then falls back to retail **XOR + shuffle** parsing ([pret/pokefirered](https://github.com/pret/pokefirered)). PC storage is read with both possible alignments after `currentBox` (offset **1** or **4**) and the layout that yields the most valid Pokémon wins. Slots that fail the checksum are skipped so random data is not shown as a species.
 
 ## Credits
 

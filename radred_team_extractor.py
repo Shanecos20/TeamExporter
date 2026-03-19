@@ -41,7 +41,14 @@ def _ability_name(species, ab_type):
         ab_type, "Primary Ability"
     )
     val = row[col].values[0]
-    return val if pd.notna(val) else "Unknown"
+    if pd.notna(val) and str(val).strip():
+        return val
+    # Some RR species have no listed hidden ability; fall back sensibly.
+    if ab_type == "h":
+        p = row["Primary Ability"].values[0]
+        if pd.notna(p) and str(p).strip():
+            return p
+    return "Unknown"
 
 
 # GBA save file layout (FRLG / Radical Red 4.1)
@@ -63,8 +70,8 @@ SLOTS_PER_BOX = 30
 
 # Sections 5-13 hold PC storage; each section contributes 3968 (0xF80) bytes of payload.
 SECTION_DATA_SIZE = 0x0F80
-# struct PokemonStorage { u8 currentBox; /* +3 pad */ BoxPokemon boxes[14][30]; }
-PC_BOX_DATA_OFFSET = 4
+# PC layout: u8 currentBox then either +3 pad (offset 4) or none (offset 1) before boxes[][].
+# _best_pc_layout() tries both.
 
 # For each personality % 24: where logical substruct G,A,E,M live among 4 physical 12-byte chunks.
 # From pret pokefirered GetSubstruct (SUBSTRUCT_CASE): type 0 at v1, type 1 at v2, ...
@@ -231,22 +238,58 @@ def _build_mon_dict(pid, nickname, species_id, item_id, move_ids, evs6, iv_word,
     }
 
 
-def _parse_boxmon_encrypted(buf):
-    """Standard Gen III BoxPokemon: decrypt secure region, unshuffle, verify checksum."""
+def _boxmon_header_ok(buf):
     if len(buf) < BOX_ENTRY_SIZE:
-        return None
-
+        return False
     pid = struct.unpack_from("<I", buf, 0)[0]
     ot_id = struct.unpack_from("<I", buf, 4)[0]
     if pid == 0 and ot_id == 0:
-        return None
-
+        return False
     flags = buf[19]
     if flags & 1:  # bad egg
-        return None
-    if (flags >> 2) & 1:  # egg (box metadata)
-        return None
+        return False
+    if (flags >> 2) & 1:  # egg in box
+        return False
+    return True
 
+
+def _parse_from_substructs(pid, nickname, growth, attacks, ev_sub, misc, level):
+    species_id = struct.unpack_from("<H", growth, 0)[0]
+    item_id = struct.unpack_from("<H", growth, 2)[0]
+    move_ids = struct.unpack_from("<4H", attacks, 0)
+    if all(m == 0 for m in move_ids):
+        return None
+    if any(m != 0 and m > len(MOVES_LIST) for m in move_ids):
+        return None
+    if item_id != 0 and item_id > len(ITEMS_LIST):
+        return None
+    evs6 = struct.unpack_from("6B", ev_sub, 0)
+    iv_word = struct.unpack_from("<I", misc, 4)[0]
+    return _build_mon_dict(pid, nickname, species_id, item_id, move_ids, evs6, iv_word, level)
+
+
+def _parse_boxmon_rr_fixed(buf, level=None):
+    """Radical Red / hack: decrypted substructs in fixed Growth→Attacks→EVs→Misc order + checksum."""
+    if not _boxmon_header_ok(buf):
+        return None
+    nickname = _decode_name(buf[8:18])
+    growth = buf[32:44]
+    attacks = buf[44:56]
+    ev_sub = buf[56:68]
+    misc = buf[68:80]
+    chk_stored = struct.unpack_from("<H", buf, 28)[0]
+    if _substruct_checksum(growth, attacks, ev_sub, misc) != chk_stored:
+        return None
+    pid = struct.unpack_from("<I", buf, 0)[0]
+    return _parse_from_substructs(pid, nickname, growth, attacks, ev_sub, misc, level)
+
+
+def _parse_boxmon_encrypted(buf, level=None):
+    """Retail Gen III: XOR + personality shuffle + checksum."""
+    if not _boxmon_header_ok(buf):
+        return None
+    pid = struct.unpack_from("<I", buf, 0)[0]
+    ot_id = struct.unpack_from("<I", buf, 4)[0]
     nickname = _decode_name(buf[8:18])
     chk_stored = struct.unpack_from("<H", buf, 28)[0]
 
@@ -265,39 +308,20 @@ def _parse_boxmon_encrypted(buf):
     if _substruct_checksum(growth, attacks, ev_sub, misc) != chk_stored:
         return None
 
-    species_id = struct.unpack_from("<H", growth, 0)[0]
-    item_id = struct.unpack_from("<H", growth, 2)[0]
-    move_ids = struct.unpack_from("<4H", attacks, 0)
-    evs6 = struct.unpack_from("6B", ev_sub, 0)
-    iv_word = struct.unpack_from("<I", misc, 4)[0]
-
-    return _build_mon_dict(pid, nickname, species_id, item_id, move_ids, evs6, iv_word, None)
+    return _parse_from_substructs(pid, nickname, growth, attacks, ev_sub, misc, level)
 
 
-def _parse_boxmon_plaintext(buf, level=None):
-    """Radical Red sometimes stores party substructs as plaintext (fixed GAEM layout)."""
-    if len(buf) < BOX_ENTRY_SIZE:
+def _parse_party_slot_last_resort(buf, level):
+    """Unchecksummed offsets — party only; avoids junk by validating move/item IDs."""
+    if not _boxmon_header_ok(buf):
         return None
-
     pid = struct.unpack_from("<I", buf, 0)[0]
-    if pid == 0:
-        return None
-    if (buf[19] >> 2) & 1:
-        return None
-
-    species_id = struct.unpack_from("<H", buf, 32)[0]
-    if species_id == 0 or species_id > len(SPECIES_NAMES):
-        return None
-
     nickname = _decode_name(buf[8:18])
-    item_id = struct.unpack_from("<H", buf, 34)[0]
-    move_ids = struct.unpack_from("<4H", buf, 44)
-    evs6 = struct.unpack_from("6B", buf, 56)
-    iv_word = struct.unpack_from("<I", buf, 72)[0]
-
-    mon = _build_mon_dict(
-        pid, nickname, species_id, item_id, move_ids, evs6, iv_word, level
-    )
+    growth = buf[32:44]
+    attacks = buf[44:56]
+    ev_sub = buf[56:68]
+    misc = buf[68:80]
+    mon = _parse_from_substructs(pid, nickname, growth, attacks, ev_sub, misc, level)
     return mon
 
 
@@ -315,33 +339,70 @@ def _mon_stats_sane(mon):
 
 
 def _parse_party_slot(buf):
-    """100-byte party struct: try encrypted BoxMon first, then RR plaintext."""
+    """Party: RR fixed layout first (same as typical RR saves), then retail encryption, then last resort."""
     if len(buf) < PARTY_ENTRY_SIZE:
         return None
     box = buf[:BOX_ENTRY_SIZE]
     level = buf[84]
 
-    mon = _parse_boxmon_encrypted(box)
-    if mon is not None:
-        mon["level"] = level
-        if _mon_stats_sane(mon):
-            return mon
+    mon = _parse_boxmon_rr_fixed(box, level=level)
+    if mon is not None and _mon_stats_sane(mon):
+        return mon
 
-    mon = _parse_boxmon_plaintext(box, level=level)
+    mon = _parse_boxmon_encrypted(box, level=level)
+    if mon is not None and _mon_stats_sane(mon):
+        return mon
+
+    mon = _parse_party_slot_last_resort(box, level)
     if mon is not None and _mon_stats_sane(mon):
         return mon
     return None
 
 
 def _parse_box_slot(buf):
-    """80-byte PC BoxPokemon — always encrypted in retail saves."""
-    mon = _parse_boxmon_encrypted(buf)
+    """PC: only accept checksum-valid RR layout or retail encryption (no unchecked reads)."""
+    mon = _parse_boxmon_rr_fixed(buf, level=None)
     if mon is not None and _mon_stats_sane(mon):
         return mon
-    mon = _parse_boxmon_plaintext(buf, level=None)
+    mon = _parse_boxmon_encrypted(buf, level=None)
     if mon is not None and _mon_stats_sane(mon):
         return mon
     return None
+
+
+def _scan_boxes_with_base(pc_blob, base_off):
+    """Parse all PC slots; return (boxes_dict, total_count)."""
+    boxes = {}
+    total = 0
+    if base_off + BOX_ENTRY_SIZE > len(pc_blob):
+        return boxes, 0
+    for bx in range(NUM_BOXES):
+        mons = []
+        for slot in range(SLOTS_PER_BOX):
+            off = base_off + (bx * SLOTS_PER_BOX + slot) * BOX_ENTRY_SIZE
+            if off + BOX_ENTRY_SIZE > len(pc_blob):
+                break
+            pkmn = _parse_box_slot(pc_blob[off : off + BOX_ENTRY_SIZE])
+            if pkmn and not pkmn["is_egg"]:
+                mons.append(pkmn)
+        if mons:
+            boxes[bx + 1] = mons
+            total += len(mons)
+    return boxes, total
+
+
+def _best_pc_layout(pc_blob):
+    """PokemonStorage may start at +1 or +4 after currentBox depending on alignment."""
+    candidates = []
+    for base in (4, 1):
+        if base + BOX_ENTRY_SIZE <= len(pc_blob):
+            boxes, n = _scan_boxes_with_base(pc_blob, base)
+            candidates.append((n, base, boxes))
+    if not candidates:
+        return {}
+    # Prefer more Pokémon; on a tie prefer offset 4 (standard compiler padding).
+    candidates.sort(key=lambda x: (-x[0], -x[1]))
+    return candidates[0][2]
 
 
 def _get_sections(sav_data):
@@ -398,19 +459,7 @@ def extract_pokemon(sav_data):
         if sec:
             pc_blob.extend(sec[:SECTION_DATA_SIZE])
 
-    boxes = {}
-    if len(pc_blob) > PC_BOX_DATA_OFFSET:
-        for bx in range(NUM_BOXES):
-            mons = []
-            for slot in range(SLOTS_PER_BOX):
-                off = PC_BOX_DATA_OFFSET + (bx * SLOTS_PER_BOX + slot) * BOX_ENTRY_SIZE
-                if off + BOX_ENTRY_SIZE > len(pc_blob):
-                    break
-                pkmn = _parse_box_slot(pc_blob[off : off + BOX_ENTRY_SIZE])
-                if pkmn and not pkmn["is_egg"]:
-                    mons.append(pkmn)
-            if mons:
-                boxes[bx + 1] = mons
+    boxes = _best_pc_layout(pc_blob) if len(pc_blob) >= 1 + BOX_ENTRY_SIZE else {}
 
     return party, boxes
 
